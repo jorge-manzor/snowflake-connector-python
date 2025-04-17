@@ -17,3 +17,5 @@ docs/utils/.DS_Store
 prod_artifacts/
 manifest.json
 credentials.yml
+__pycache__
+**/__pycache__
