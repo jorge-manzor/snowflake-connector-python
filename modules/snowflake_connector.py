@@ -406,6 +406,47 @@ class SnowflakeDWH:
             if self.engine:
                 self.engine.dispose()
                 
+    def table_exists(self, 
+                table_name: str, 
+                schema_name: Optional[str] = None, 
+                database_name: Optional[str] = None) -> bool:
+        """
+        Check if a table exists in Snowflake using a simpler approach.
+        
+        Args:
+            table_name: Name of the table to check
+            schema_name: Schema name (defaults to connection schema if None)
+            database_name: Database name (defaults to connection database if None)
+            
+        Returns:
+            True if the table exists, False otherwise
+        """
+        schema_name = schema_name or self.schema
+        database_name = database_name or self.database
+        
+        try:
+            conn = self.get_connection(database=database_name, schema=schema_name)
+            cursor = conn.cursor()
+            
+            # Try to select 0 rows from the table - will raise an exception if it doesn't exist
+            query = f"SELECT * FROM {database_name}.{schema_name}.{table_name} LIMIT 0"
+            cursor.execute(query)
+            
+            cursor.close()
+            conn.close()
+            
+            return True
+            
+        except Exception as e:
+            # If we get an exception, the table likely doesn't exist
+            if "does not exist" in str(e).lower():
+                return False
+            else:
+                # If it's some other error, log it but still return False
+                logger.warning(f"Unexpected error checking if table exists: {e}")
+                return False
+
+
     def merge_dataframe(self,
                     dataframe: pd.DataFrame,
                     target_table: str,
@@ -519,27 +560,45 @@ class SnowflakeDWH:
             logger.info("Executing MERGE operation")
             cursor.execute(merge_sql)
             
-            # Get merge operation stats
-            result_count = cursor.fetchone()[0] if cursor.description else cursor.rowcount
-            logger.info(f"MERGE affected {result_count} rows")
+            # Get operation stats
+            # Use RESULT_SCAN to get the operation stats
             
-            # Step 5: Clean up temporary table
-            logger.info(f"Dropping temporary table {qualified_temp}")
-            cursor.execute(f"DROP TABLE IF EXISTS {qualified_temp}")
+            # Get the query ID
+            query_id = cursor.sfqid
+            
+            count_sql = f"SELECT * FROM TABLE(RESULT_SCAN('{query_id}'))"
+            cursor.execute(count_sql)
+            result = cursor.fetchone()
+            
+            if result:
+                inserted_count = result[0]
+                updated_count = result[1]
+                total_affected = inserted_count + updated_count
+                
+                logger.info(f"Merge inserted {inserted_count} rows")
+                logger.info(f"Merge updated {updated_count} rows")
+                logger.info(f"Total affected rows: {total_affected}")
+            else:
+                logger.info("No result information available")
+                
+            
+            # Clean up if we created a temp table
+            if isinstance(dataframe, pd.DataFrame) and temp_table:
+                logger.info(f"Dropping temporary table {qualified_temp}")
+                cursor.execute(f"DROP TABLE IF EXISTS {qualified_temp}")
             
             return {
                 "success": True,
-                "affected_rows": result_count,
-                "source_rows": len(dataframe)
+                "affected_rows": total_affected,
+                "source_rows": len(dataframe) if isinstance(dataframe, pd.DataFrame) else None
             }
             
         except Exception as e:
-            logger.error(f"Error during merge operation: {e}")
-            # Try to clean up the temporary resources if they exist
+            logger.error(f"Error during custom merge operation: {e}")
+            # Try to clean up temporary resources
             try:
-                if cursor:
-                    if 'qualified_temp' in locals():
-                        cursor.execute(f"DROP TABLE IF EXISTS {qualified_temp}")
+                if cursor and isinstance(dataframe, pd.DataFrame) and 'qualified_temp' in locals():
+                    cursor.execute(f"DROP TABLE IF EXISTS {qualified_temp}")
             except Exception as cleanup_error:
                 logger.warning(f"Error cleaning up resources: {cleanup_error}")
             raise
@@ -685,8 +744,26 @@ class SnowflakeDWH:
             cursor.execute(final_sql)
             
             # Get operation stats
-            result_count = cursor.fetchone()[0] if cursor.description else cursor.rowcount
-            logger.info(f"Merge affected {result_count} rows")
+            # Use RESULT_SCAN to get the operation stats
+            
+            # Get the query ID
+            query_id = cursor.sfqid
+            
+            count_sql = f"SELECT * FROM TABLE(RESULT_SCAN('{query_id}'))"
+            cursor.execute(count_sql)
+            result = cursor.fetchone()
+            
+            if result:
+                inserted_count = result[0]
+                updated_count = result[1]
+                total_affected = inserted_count + updated_count
+                
+                logger.info(f"Merge inserted {inserted_count} rows")
+                logger.info(f"Merge updated {updated_count} rows")
+                logger.info(f"Total affected rows: {total_affected}")
+            else:
+                logger.info("No result information available")
+                
             
             # Clean up if we created a temp table
             if isinstance(source_data, pd.DataFrame) and temp_table:
@@ -695,7 +772,7 @@ class SnowflakeDWH:
             
             return {
                 "success": True,
-                "affected_rows": result_count,
+                "affected_rows": total_affected,
                 "source_rows": len(source_data) if isinstance(source_data, pd.DataFrame) else None
             }
             
@@ -705,246 +782,6 @@ class SnowflakeDWH:
             try:
                 if cursor and isinstance(source_data, pd.DataFrame) and 'qualified_source' in locals():
                     cursor.execute(f"DROP TABLE IF EXISTS {qualified_source}")
-            except Exception as cleanup_error:
-                logger.warning(f"Error cleaning up resources: {cleanup_error}")
-            raise
-        finally:
-            if cursor:
-                cursor.close()
-            if conn:
-                conn.close()
-
-
-    def historize_data(self,
-                    dataframe: pd.DataFrame,
-                    target_table: str,
-                    schema_name: Optional[str] = None,
-                    database_name: Optional[str] = None,
-                    key_columns: List[str] = None,
-                    effective_from_col: str = "effective_from",
-                    effective_to_col: str = "effective_to",
-                    current_indicator_col: Optional[str] = "is_current",
-                    audit_columns: Optional[Dict[str, str]] = None,
-                    chunk_size: int = 10000) -> Dict[str, Any]:
-        """
-        Implement a Type 2 Slowly Changing Dimension (SCD) pattern to maintain full history.
-        
-        Args:
-            dataframe: Source pandas DataFrame with new/updated records
-            target_table: Target history table
-            schema_name: Schema name (defaults to connection schema)
-            database_name: Database name (defaults to connection database)
-            key_columns: List of business key columns that identify unique entities
-            effective_from_col: Column name for the start date of a record's validity
-            effective_to_col: Column name for the end date of a record's validity
-            current_indicator_col: Column name for the flag indicating current record
-            audit_columns: Dictionary mapping of audit columns to add/update
-                        e.g. {"created_by": "SYSTEM", "created_at": "CURRENT_TIMESTAMP()"}
-            chunk_size: Batch size for loading data
-            
-        Returns:
-            Dictionary with operation results
-        """
-        if not key_columns:
-            raise ValueError("key_columns must be specified for historization")
-        
-        schema_name = schema_name or self.schema
-        database_name = database_name or self.database
-        
-        # Generate temp table name
-        temp_table = f"TEMP_HIST_{str(uuid.uuid4()).replace('-', '')[:8]}"
-        
-        # Ensure the dataframe has the required SCD columns
-        if effective_from_col not in dataframe.columns:
-            raise ValueError(f"DataFrame must contain {effective_from_col} column")
-        
-        # Add effective_to and current indicator if they don't exist
-        if effective_to_col not in dataframe.columns:
-            dataframe[effective_to_col] = None  # Will be filled with NULL/None in Snowflake
-        
-        if current_indicator_col and current_indicator_col not in dataframe.columns:
-            dataframe[current_indicator_col] = True
-        
-        # Fully qualify table names
-        qualified_target = f"{target_table}"
-        qualified_temp = f"{temp_table}"
-        
-        if schema_name:
-            qualified_target = f"{schema_name}.{qualified_target}"
-            qualified_temp = f"{schema_name}.{qualified_temp}"
-            
-        if database_name:
-            qualified_target = f"{database_name}.{qualified_target}"
-            qualified_temp = f"{database_name}.{qualified_temp}"
-        
-        conn = None
-        cursor = None
-        
-        try:
-            # Create a single connection to use throughout the process
-            conn = self.get_connection(database=database_name, schema=schema_name)
-            cursor = conn.cursor()
-            
-            # Step 1: Create a temporary table with the same structure as the target
-            logger.info(f"Creating temporary table {qualified_temp}")
-            cursor.execute(f"CREATE TEMPORARY TABLE {qualified_temp} LIKE {qualified_target}")
-            
-            # Step 2: Load data using direct INSERT VALUES approach
-            logger.info(f"Loading data into temporary table {temp_table}")
-            
-            # Make a copy of the dataframe to avoid modifying the original
-            df_copy = dataframe.copy()
-            
-            # Convert datetime columns to ISO format strings that Snowflake can parse
-            for col in df_copy.select_dtypes(include=['datetime64']).columns:
-                df_copy[col] = df_copy[col].dt.strftime('%Y-%m-%d %H:%M:%S.%f')
-            
-            # Build INSERT statement with VALUES clause
-            columns = list(df_copy.columns)
-            column_list = ", ".join(columns)
-            
-            # Generate VALUES clause for each row
-            values_list = []
-            for _, row in df_copy.iterrows():
-                values = []
-                for col in columns:
-                    if pd.isna(row[col]):
-                        values.append("NULL")
-                    elif isinstance(row[col], (int, float)):
-                        values.append(str(row[col]))
-                    else:
-                        # Escape single quotes in string values
-                        val = str(row[col])
-                        escaped_val = val.replace("'", "''")
-                        values.append(f"'{escaped_val}'")
-                values_list.append(f"({', '.join(values)})")
-            
-            # Execute INSERT in batches to avoid statement size limits
-            batch_size = 1000  # Smaller batch size for safety
-            for i in range(0, len(values_list), batch_size):
-                batch_values = values_list[i:i+batch_size]
-                insert_sql = f"INSERT INTO {qualified_temp} ({column_list}) VALUES {', '.join(batch_values)}"
-                cursor.execute(insert_sql)
-            
-            # Verify data was loaded
-            logger.info(f"Verifying data was loaded into {qualified_temp}")
-            cursor.execute(f"SELECT COUNT(*) FROM {qualified_temp}")
-            count_result = cursor.fetchone()
-            row_count = count_result[0] if count_result else 0
-            logger.info(f"Rows in temporary table: {row_count}")
-            
-            if row_count == 0:
-                raise ValueError(f"No data was loaded into temporary table {qualified_temp}")
-            
-            # Step 3: Build and execute the SCD Type 2 merge
-            # Build the key matching condition
-            key_match = ' AND '.join([f"target.{col} = source.{col}" for col in key_columns])
-            
-            # Build the change detection condition (all columns except keys and SCD columns)
-            scd_cols = [effective_from_col, effective_to_col]
-            if current_indicator_col:
-                scd_cols.append(current_indicator_col)
-                
-            # Add any audit columns to the exclusion list
-            audit_cols = list(audit_columns.keys()) if audit_columns else []
-            
-            # Determine columns to check for changes
-            all_columns = list(dataframe.columns)
-            change_cols = [col for col in all_columns if col not in key_columns + scd_cols + audit_cols]
-            
-            # Build change detection condition
-            if change_cols:
-                change_condition = ' OR '.join([f"target.{col} <> source.{col} OR (target.{col} IS NULL AND source.{col} IS NOT NULL) OR (target.{col} IS NOT NULL AND source.{col} IS NULL)" for col in change_cols])
-            else:
-                # If no change columns, just use a simple condition that's always false
-                change_condition = "FALSE"
-            
-            # Prepare audit column assignments
-            audit_updates = ""
-            if audit_columns:
-                audit_updates = ", " + ", ".join([f"{col} = {val}" for col, val in audit_columns.items()])
-            
-            # The SCD Type 2 merge SQL
-            historize_sql = f"""
-            -- Step 1: Update existing current records that have changes (expire them)
-            UPDATE {qualified_target} target
-            SET 
-                {effective_to_col} = source.{effective_from_col},
-                {current_indicator_col if current_indicator_col else "'dummy'"} = FALSE{audit_updates}
-            FROM {qualified_temp} source
-            WHERE {key_match}
-            AND target.{current_indicator_col if current_indicator_col else "'dummy'"} = TRUE
-            AND ({change_condition});
-            
-            -- Step 2: Insert new versions of changed records
-            INSERT INTO {qualified_target}
-            SELECT source.*
-            FROM {qualified_temp} source
-            JOIN {qualified_target} target
-            ON {key_match}
-            WHERE target.{current_indicator_col if current_indicator_col else "'dummy'"} = FALSE
-            AND target.{effective_to_col} = source.{effective_from_col};
-            
-            -- Step 3: Insert completely new records
-            INSERT INTO {qualified_target}
-            SELECT source.*
-            FROM {qualified_temp} source
-            WHERE NOT EXISTS (
-                SELECT 1 
-                FROM {qualified_target} target 
-                WHERE {key_match}
-            );
-            """
-            
-            logger.info("Executing SCD Type 2 historization")
-            cursor.execute(historize_sql)
-            
-            # Get operation stats - try to get detailed counts if available
-            try:
-                # First try to get counts from the last statement
-                insert_count = cursor.rowcount
-                
-                # Execute additional queries to get more detailed stats
-                cursor.execute(f"""
-                SELECT 
-                    SUM(CASE WHEN {effective_to_col} IS NOT NULL AND {current_indicator_col if current_indicator_col else "'dummy'"} = FALSE THEN 1 ELSE 0 END) as expired_records,
-                    SUM(CASE WHEN {effective_to_col} IS NULL AND {current_indicator_col if current_indicator_col else "'dummy'"} = TRUE THEN 1 ELSE 0 END) as current_records
-                FROM {qualified_target}
-                WHERE {' OR '.join([f"{col} IN (SELECT {col} FROM {qualified_temp})" for col in key_columns])}
-                """)
-                
-                stats = cursor.fetchone()
-                expired_count = stats[0] if stats else 0
-                current_count = stats[1] if stats else 0
-                
-                detailed_stats = {
-                    "expired_records": int(expired_count) if expired_count is not None else 0,
-                    "current_records": int(current_count) if current_count is not None else 0,
-                    "total_affected": int(insert_count) if insert_count is not None else 0
-                }
-            except Exception as e:
-                # If detailed stats fail, just use the basic count
-                logger.warning(f"Could not get detailed historization stats: {e}")
-                detailed_stats = {"total_affected": cursor.rowcount}
-            
-            # Step 4: Clean up temporary table
-            logger.info(f"Dropping temporary table {qualified_temp}")
-            cursor.execute(f"DROP TABLE IF EXISTS {qualified_temp}")
-            
-            return {
-                "success": True,
-                "source_rows": len(dataframe),
-                "stats": detailed_stats,
-                "historization_type": "SCD Type 2",
-                "target_table": qualified_target
-            }
-            
-        except Exception as e:
-            logger.error(f"Error during historization: {e}")
-            # Try to clean up temp table if it exists
-            try:
-                if cursor and 'qualified_temp' in locals():
-                    cursor.execute(f"DROP TABLE IF EXISTS {qualified_temp}")
             except Exception as cleanup_error:
                 logger.warning(f"Error cleaning up resources: {cleanup_error}")
             raise
