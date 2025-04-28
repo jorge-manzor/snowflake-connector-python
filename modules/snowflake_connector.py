@@ -246,6 +246,52 @@ class SnowflakeDWH:
             if self.engine:
                 self.engine.dispose()
     
+    def execute_query(self,
+                    query: str = None,
+                    filename: str = None,
+                    database: Optional[str] = None,
+                    schema: Optional[str] = None,
+                    **kwargs) -> bool:
+        """
+        Execute a non-SELECT query (DELETE, UPDATE, INSERT, etc.) that doesn't return results.
+        
+        Args:
+            query: SQL query string (optional if filename is provided)
+            filename: Path to SQL file (optional if query is provided)
+            database: Optional database override
+            schema: Optional schema override
+            **kwargs: Parameters to replace in the query if using a file
+            
+        Returns:
+            Boolean indicating success
+        """
+        start_time = timeit.default_timer()
+        
+        if not query and not filename:
+            raise ValueError("Either query or filename must be provided")
+            
+        try:
+            engine = self.get_engine(database=database, schema=schema)
+            
+            if filename:
+                query = self.parse_query(filename=filename, **kwargs)
+                
+            # Execute the query without returning results
+            with engine.connect() as connection:
+                connection.execute(query)
+                # Remove the connection.commit() line
+            
+            execution_time = timeit.default_timer() - start_time
+            logger.info(f'Snowflake query execution time: {execution_time:.2f} seconds')
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error executing query: {e}")
+            return False
+        finally:
+            if self.engine:
+                self.engine.dispose()
+    
     def query_to_pandas(self, 
                        query: str = None, 
                        filename: str = None, 
