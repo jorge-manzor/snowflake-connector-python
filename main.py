@@ -6,6 +6,7 @@ from examples.query_to_pandas_string_example import run_query_to_pandas_string_e
 from examples.query_to_pandas_file_example import run_query_to_pandas_file_example
 from examples.cursor_to_pandas_string_example import run_cursor_to_pandas_string_example
 from examples.cursor_to_pandas_file_example import run_cursor_to_pandas_file_example
+from examples.execute_query_example import execute_query_string_example
 
 
 def parse_arguments():
@@ -51,9 +52,15 @@ def main():
     #     if not results.empty:
     #         logger.info(f"Query returned {len(results)} rows")
     
+    # if args.example in ['query', 'all']:
+    #     logger.info("Running query from a string file example")
+    #     results = run_cursor_to_pandas_file_example()
+    #     if not results.empty:
+    #         logger.info(f"Query returned {len(results)} rows")
+    
     if args.example in ['query', 'all']:
         logger.info("Running query from a string file example")
-        results = run_cursor_to_pandas_file_example()
+        results = execute_query_string_example()
         if not results.empty:
             logger.info(f"Query returned {len(results)} rows")
     

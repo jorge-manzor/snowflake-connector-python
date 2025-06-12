@@ -7,6 +7,7 @@ import uuid
 from typing import Dict, Any, Optional, Union, List
 from os import environ, path
 from sqlalchemy import create_engine
+from sqlalchemy import text
 from snowflake.sqlalchemy import URL  
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -278,8 +279,8 @@ class SnowflakeDWH:
                 
             # Execute the query without returning results
             with engine.connect() as connection:
-                connection.execute(query)
-                # Remove the connection.commit() line
+                connection.execute(text(query))  # Wrap query with text()
+                connection.commit()  # Add commit for DDL operations
             
             execution_time = timeit.default_timer() - start_time
             logger.info(f'Snowflake query execution time: {execution_time:.2f} seconds')
